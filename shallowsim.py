@@ -396,9 +396,9 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, dp, static_latency=0.05
     return dispatch_time, combine_time
 
 
-def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, dp=8, print_console=False):
+def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, tp_list=[1, 2, 4], dp=8, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'Dispatch', 'Combine'])
-    for tp in [4, 8]:
+    for tp in tp_list:
         for key in gpu_dict.keys():
             dispatch_time, combine_time = _prefill_alltoall(
                 args, gpu_dict[key], seq_len, tp, dp)
