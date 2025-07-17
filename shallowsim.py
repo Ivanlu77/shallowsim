@@ -57,7 +57,7 @@ class Config:
 class GPU_perf:
     def __init__(self, gpu_type, sm, comm_sm, gpu_per_node,
                  fp16_flops, fp8_flops, fp4_flops,
-                 mem, mem_bw, nvlink_bw, pcie_bw, discount_rate):
+                 mem, mem_bw, ar_bw, a2a_bw, pcie_bw, discount_rate):
         self.gpu_type = gpu_type
         self.sm = sm
         self.gpu_per_node = gpu_per_node
@@ -67,7 +67,8 @@ class GPU_perf:
         self.fp4_flops = fp4_flops
         self.mem = mem
         self.mem_bw = mem_bw
-        self.nvlink_bw = nvlink_bw
+        self.ar_bw = ar_bw
+        self.a2a_bw = a2a_bw
         self.pcie_bw = pcie_bw
         self.discount_rate = discount_rate
 
@@ -83,14 +84,17 @@ class GPU_perf:
     def get_mem_bw(self):
         return self.mem_bw * self.discount_rate
 
-    def get_nvlink_bw(self):
-        return self.nvlink_bw * self.discount_rate
+    def get_ar_bw(self):
+        return self.ar_bw * self.discount_rate
+
+    def get_a2a_bw(self):
+        return self.a2a_bw * self.discount_rate
 
     def get_pcie_bw(self):
         return self.pcie_bw * self.discount_rate
 
 
-def get_gpu_info(filename='./device/gpuinfo.csv',
+def get_gpu_info(filename='./device/gpu_info.csv',
                  discount_rate=0.85,
                  device_list=[],
                  decoding_mode=False, print_console=False):
@@ -122,7 +126,8 @@ def get_gpu_info(filename='./device/gpuinfo.csv',
             fp4_flops=c['fp4'],
             mem=c['mem'],
             mem_bw=c['mem_bw'],
-            nvlink_bw=c['nvlink_bw'],
+            ar_bw=c['ar_bw'],
+            a2a_bw=c['a2a_bw'],
             pcie_bw=c['pcie_bw'],
             gpu_per_node=c['gpu_per_node'],
             discount_rate=discount_rate)
@@ -250,9 +255,8 @@ def mla_elapse_time(args: ModelArgs,
             total = gemm_fp4_t + attn_fp16_t
 
     ar_len = batchsize if decoding_mode else seq_len
-    all_reduce_comm_size = ar_len * args.dim * 2 / 1024/1024  # fp16 take 2Bytes
-    all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
-
+    all_reduce_comm_size = ar_len * args.dim * 2 / 1024/1024  # fp16 take 2Byte
+    all_reduce_t = all_reduce_comm_size / gpu.get_ar_bw() + min_ar_time
     tp_time = {}
     for v in tp:
         if v == 1:
@@ -367,21 +371,22 @@ def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
     return df
 
 
-def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
-    if gpu.gpu_per_node == 8:
-        dp = gpu.gpu_per_node/tp
+def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, dp, static_latency=0.05):
+    device_number = tp * dp
+    if gpu.gpu_per_node < device_number:
+        dp_intranode = gpu.gpu_per_node/tp
         dispatch_node = 4
-        dispatch_size = (dispatch_node - 1) * dp * seq_len * \
+        dispatch_size = (dispatch_node - 1) * dp_intranode * seq_len * \
             args.n_activated_experts / gpu.gpu_per_node * args.dim / 1024/1024
         comm_bw = gpu.get_pcie_bw() * gpu.gpu_per_node
     else:
-        # NVL72
+        # Supernode
         expert_num = math.ceil(args.n_routed_experts / gpu.gpu_per_node)
         dispatch_prob = (args.n_routed_experts - expert_num) / \
             args.n_routed_experts
         dispatch_size = dispatch_prob * args.n_activated_experts * \
             seq_len/tp * args.dim / 1024/1024
-        comm_bw = gpu.get_nvlink_bw()
+        comm_bw = gpu.get_a2a_bw()
 
     combine_size = 2 * dispatch_size  # fp16
     if gpu.get_fp4_flops != 0:
@@ -391,12 +396,12 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
     return dispatch_time, combine_time
 
 
-def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
+def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, dp=8, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'Dispatch', 'Combine'])
     for tp in [4, 8]:
         for key in gpu_dict.keys():
             dispatch_time, combine_time = _prefill_alltoall(
-                args, gpu_dict[key], seq_len, tp)
+                args, gpu_dict[key], seq_len, tp, dp)
             df.loc[len(df)] = [key, tp, dispatch_time, combine_time]
     if print_console:
         df['TP'] = df['TP'].astype(int).astype(str)
@@ -412,7 +417,7 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
                                         enable_gemm_fp4=True)
     dense_mlp = _prefill_dense_mlp(args, gpu, seq_len)
     shared, routed = _prefill_moe(args, gpu, seq_len, tp, dp)
-    dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp)
+    dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp, dp)
     return dense_mla, dense_mlp, tp_mla[tp], shared, combine, routed, dispatch
 
 
@@ -652,12 +657,12 @@ def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_com
         comm_bw = gpu.get_pcie_bw()
         # single host deployment
         if args.n_routed_experts / (expert_num - 1) == gpu.gpu_per_node:
-            comm_bw = gpu.get_nvlink_bw()
+            comm_bw = gpu.get_a2a_bw()
     #NVL72 /144 / 576
     elif (gpu.gpu_per_node in NVL_GPU_LIST) & (device_num >  gpu.gpu_per_node):
             comm_bw = gpu.get_pcie_bw()
     else:
-        comm_bw = gpu.get_nvlink_bw()
+        comm_bw = gpu.get_a2a_bw()
 
     dispatch_t = dispatch_size / comm_bw + static_latency * mbs
     combine_t = combine_size / comm_bw + static_latency * mbs
